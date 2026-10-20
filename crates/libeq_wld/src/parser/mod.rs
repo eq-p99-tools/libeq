@@ -1,6 +1,8 @@
 mod error;
 pub mod fragments;
 mod strings;
+#[cfg(test)]
+pub(crate) mod test_wld;
 
 use core::fmt::Debug;
 use std::collections::BTreeMap;
@@ -27,13 +29,59 @@ pub type WResult<'a, O> = IResult<&'a [u8], O, WldDocError<'a>>;
 #[derive(Debug)]
 pub struct WldDoc {
     header: WldHeader,
+    format: WldFormat,
     strings: StringHash,
     fragments: Vec<FragmentType>,
+    unread: Vec<UnreadBytes>,
 }
+
+/// The two known .wld layouts, told apart by the header's version.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WldFormat {
+    /// Version `0x00015500`.
+    Old,
+    /// Version `0x1000C800`. Mesh ([DmSpriteDef2]) texture coordinates are 32-bit floats.
+    New,
+}
+
+impl WldFormat {
+    pub const OLD_VERSION: u32 = 0x0001_5500;
+    pub const NEW_VERSION: u32 = 0x1000_C800;
+
+    /// The layout a header version names, if it is a known one.
+    pub fn from_version(version: u32) -> Option<Self> {
+        match version {
+            Self::OLD_VERSION => Some(Self::Old),
+            Self::NEW_VERSION => Some(Self::New),
+            _ => None,
+        }
+    }
+}
+
+/// A fragment whose parser stopped short of its end by more than the
+/// alignment padding a fragment may carry.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnreadBytes {
+    /// The fragment's index in the file.
+    pub index: usize,
+    pub fragment_type: u32,
+    /// How many bytes at the end of the fragment were not read.
+    pub bytes: usize,
+}
+
+/// Fragments are padded so their size is a multiple of 4.
+const MAX_PADDING: usize = 3;
 
 impl WldDoc {
     pub fn parse(input: &[u8]) -> Result<WldDoc, Vec<WldDocError<'_>>> {
         let (i, header) = WldHeader::parse(input).map_err(|e| vec![e.into()])?;
+        let format = WldFormat::from_version(header.version).ok_or_else(|| {
+            vec![WldDocError::UnsupportedVersion {
+                version: header.version,
+            }]
+        })?;
 
         let (i, string_hash_data) = take(header.string_hash_size)
             .parse(i)
@@ -44,10 +92,20 @@ impl WldDoc {
             .parse(i)
             .map_err(|e| vec![e.into()])?;
 
-        let (fragments, errors): (Vec<_>, Vec<_>) = fragment_headers
+        let (parsed, errors): (Vec<_>, Vec<_>) = fragment_headers
             .into_iter()
             .enumerate()
-            .map(|(idx, h)| h.parse_body(idx))
+            .map(|(idx, h)| {
+                let fragment_type = h.fragment_type;
+                h.parse_body(idx, format).map(|(fragment, unread)| {
+                    let unread = (unread > MAX_PADDING).then_some(UnreadBytes {
+                        index: idx,
+                        fragment_type,
+                        bytes: unread,
+                    });
+                    (fragment, unread)
+                })
+            })
             .partition_map(|res| match res {
                 Ok(frag) => Either::Left(frag),
                 Err(e) => Either::Right(e),
@@ -57,11 +115,26 @@ impl WldDoc {
             return Err(errors);
         }
 
+        let (fragments, unread): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
         Ok(WldDoc {
             header,
+            format,
             strings,
             fragments,
+            unread: unread.into_iter().flatten().collect(),
         })
+    }
+
+    /// The layout of this file, from its header's version.
+    pub fn format(&self) -> WldFormat {
+        self.format
+    }
+
+    /// Fragments the parser did not read to their end, beyond alignment
+    /// padding. Data left there was not understood, so a non-empty list means
+    /// part of the file was not read.
+    pub fn unread(&self) -> &[UnreadBytes] {
+        &self.unread
     }
 
     pub fn fragment_headers_by_offset(input: &[u8]) -> BTreeMap<usize, FragmentHeader<'_>> {
@@ -315,7 +388,13 @@ impl<'a> FragmentHeader<'a> {
         ))
     }
 
-    fn parse_body(self, index: usize) -> Result<FragmentType, WldDocError<'a>> {
+    /// Parses the fragment body, returning it with the number of bytes at its
+    /// end that the body's parser did not consume.
+    fn parse_body(
+        self,
+        index: usize,
+        format: WldFormat,
+    ) -> Result<(FragmentType, usize), WldDocError<'a>> {
         let parsed = match self.fragment_type {
             DmSpriteDef::TYPE_ID => match self.detect_0x2c_variant() {
                 FragmentGame::EverQuest => Some(
@@ -419,7 +498,7 @@ impl<'a> FragmentHeader<'a> {
                 Some(Region::parse(self.field_data).map(|f| (f.0, FragmentType::Region(f.1))))
             }
             DmSpriteDef2::TYPE_ID => Some(
-                DmSpriteDef2::parse(self.field_data)
+                DmSpriteDef2::parse_format(self.field_data, format)
                     .map(|f| (f.0, FragmentType::DmSpriteDef2(f.1))),
             ),
             MaterialPalette::TYPE_ID => Some(
@@ -483,20 +562,22 @@ impl<'a> FragmentHeader<'a> {
         };
 
         match parsed {
-            Some(res) => res.map(|r| r.1).map_err(|e| match e.into() {
-                WldDocError::Parse { input, message } => WldDocError::ParseFragment {
-                    index,
-                    offset: self.field_data.offset(input),
-                    header: self,
-                    message,
-                },
-                // This should never happen, the parse functions _only_
-                // generate WldDocError::Parse errors
-                e => panic!(
-                    "Invalid error type encountered when parsing fragment body: {:?}",
-                    e
-                ),
-            }),
+            Some(res) => res
+                .map(|(rest, r)| (r, rest.len()))
+                .map_err(|e| match e.into() {
+                    WldDocError::Parse { input, message } => WldDocError::ParseFragment {
+                        index,
+                        offset: self.field_data.offset(input),
+                        header: self,
+                        message,
+                    },
+                    // This should never happen, the parse functions _only_
+                    // generate WldDocError::Parse errors
+                    e => panic!(
+                        "Invalid error type encountered when parsing fragment body: {:?}",
+                        e
+                    ),
+                }),
             None => Err(WldDocError::UnknownFragment {
                 index,
                 header: self,
@@ -531,7 +612,118 @@ impl<'a> FragmentHeader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::test_wld::{Coordinates, WldBuilder, one_triangle, palette};
     use super::*;
+
+    fn only_mesh(doc: &WldDoc) -> &DmSpriteDef2 {
+        let meshes: Vec<_> = doc.fragment_iter::<DmSpriteDef2>().collect();
+        assert_eq!(meshes.len(), 1);
+        meshes[0]
+    }
+
+    #[test]
+    fn it_reads_new_format_mesh_coordinates_as_floats() {
+        let data = one_triangle(
+            WldFormat::NEW_VERSION,
+            0x8000_0001,
+            Coordinates::New([(0.0, 0.0), (1.0, 0.0), (0.5, -2.25)]),
+        );
+        let doc = WldDoc::parse(&data).unwrap();
+        let mesh = only_mesh(&doc);
+
+        assert_eq!(doc.format(), WldFormat::New);
+        assert_eq!(
+            mesh.texture_coordinates,
+            TextureCoordinates::New(vec![(0.0, 0.0), (1.0, 0.0), (0.5, -2.25)])
+        );
+        // What follows the coordinates is read where the format puts it.
+        assert_eq!(mesh.vertex_normals, vec![(0, 0, 127); 3]);
+        assert_eq!(mesh.faces[0].vertex_indexes, (0, 1, 2));
+        assert_eq!(mesh.face_material_groups, vec![(1, 0)]);
+        assert_eq!(mesh.vertex_material_groups, vec![(3, 0)]);
+        assert_eq!(doc.unread(), &[]);
+    }
+
+    #[test]
+    fn it_reads_old_format_mesh_coordinates_as_integers() {
+        let data = one_triangle(
+            WldFormat::OLD_VERSION,
+            0x8000_0001,
+            Coordinates::Old([(0, 0), (256, 0), (128, -576)]),
+        );
+        let doc = WldDoc::parse(&data).unwrap();
+        let mesh = only_mesh(&doc);
+
+        assert_eq!(doc.format(), WldFormat::Old);
+        assert_eq!(
+            mesh.texture_coordinates,
+            TextureCoordinates::Old(vec![(0, 0), (256, 0), (128, -576)])
+        );
+        assert_eq!(mesh.faces[0].vertex_indexes, (0, 1, 2));
+        assert_eq!(mesh.face_material_groups, vec![(1, 0)]);
+        assert_eq!(doc.unread(), &[]);
+    }
+
+    #[test]
+    fn it_round_trips_both_formats() {
+        for data in [
+            one_triangle(
+                WldFormat::NEW_VERSION,
+                0x8000_0001,
+                Coordinates::New([(0.0, 0.0), (1.0, 0.0), (0.5, -2.25)]),
+            ),
+            one_triangle(
+                WldFormat::OLD_VERSION,
+                0x8000_0001,
+                Coordinates::Old([(0, 0), (256, 0), (128, -576)]),
+            ),
+        ] {
+            let doc = WldDoc::parse(&data).unwrap();
+            let reparsed = WldDoc::parse(&doc.to_bytes()).unwrap();
+            assert_eq!(reparsed.format(), doc.format());
+            assert_eq!(only_mesh(&reparsed), only_mesh(&doc));
+            assert_eq!(reparsed.to_bytes(), doc.to_bytes());
+        }
+    }
+
+    #[test]
+    fn it_rejects_unknown_versions_by_name() {
+        let data = one_triangle(
+            0x1234_5678,
+            0x8000_0001,
+            Coordinates::Old([(0, 0), (256, 0), (128, 0)]),
+        );
+        let errors = WldDoc::parse(&data).unwrap_err();
+
+        assert!(matches!(
+            errors[..],
+            [WldDocError::UnsupportedVersion {
+                version: 0x1234_5678
+            }]
+        ));
+    }
+
+    #[test]
+    fn it_reports_fragments_not_read_to_their_end() {
+        let mut wld = WldBuilder::new(WldFormat::OLD_VERSION);
+        let name = wld.name("P_MP");
+        // The meshes in the tests above end with a byte of padding, which is
+        // not reported; these eight bytes are data nobody read.
+        let mut overlong = palette(name, &[]);
+        overlong.extend([0xab; 8]);
+        wld.fragment(MaterialPalette::TYPE_ID, palette(name, &[]));
+        wld.fragment(MaterialPalette::TYPE_ID, overlong);
+        let doc = WldDoc::parse(&wld.build()).unwrap();
+
+        assert_eq!(
+            doc.unread(),
+            &[UnreadBytes {
+                index: 1,
+                fragment_type: MaterialPalette::TYPE_ID,
+                bytes: 8,
+            }]
+        );
+    }
 
     #[cfg(feature = "gamedata")]
     #[test]
