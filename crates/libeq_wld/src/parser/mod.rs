@@ -665,6 +665,26 @@ mod tests {
     }
 
     #[test]
+    fn it_parses_materials_with_unlisted_user_defined_types() {
+        let data = one_triangle(
+            WldFormat::OLD_VERSION,
+            0x8000_0018,
+            Coordinates::Old([(0, 0), (256, 0), (128, 0)]),
+        );
+        let doc = WldDoc::parse(&data).unwrap();
+        let materials: Vec<_> = doc.fragment_iter::<MaterialDef>().collect();
+
+        assert_eq!(
+            materials[0].render_method,
+            RenderMethod::UserDefined {
+                material_type: MaterialType::Unlisted(0x18)
+            }
+        );
+        let reparsed = WldDoc::parse(&doc.to_bytes()).unwrap();
+        assert_eq!(reparsed.to_bytes(), doc.to_bytes());
+    }
+
+    #[test]
     fn it_round_trips_both_formats() {
         for data in [
             one_triangle(
