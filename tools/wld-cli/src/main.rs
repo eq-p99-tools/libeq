@@ -144,6 +144,14 @@ fn print_error(error: &WldDocError) -> Result<(), std::io::Error> {
             let mut hex_printer = PrinterBuilder::new(&mut out).build();
             hex_printer.print_all(header.field_data).unwrap();
         }
+        WldDocError::UnsupportedVersion { version } => {
+            write!(
+                out,
+                "\n{} 0x{:08x}\n",
+                "Unsupported WLD version".red(),
+                version
+            )?;
+        }
         WldDocError::UnknownFragment { index, header } => {
             write!(out, "\n{}\n", "Unknown Fragment".yellow())?;
             writeln!(

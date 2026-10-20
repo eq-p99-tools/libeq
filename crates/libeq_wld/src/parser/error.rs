@@ -18,6 +18,10 @@ pub enum WldDocError<'a> {
         index: usize,
         header: FragmentHeader<'a>,
     },
+    /// The header names a WLD version this parser does not know the layout of.
+    UnsupportedVersion {
+        version: u32,
+    },
 }
 
 impl ContextError<&'_ [u8]> for WldDocError<'_> {
