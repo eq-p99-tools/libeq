@@ -33,6 +33,11 @@ impl WldBuilder {
         self.fragments.len() as i32
     }
 
+    /// Adds a fragment exactly as given, with no padding added.
+    pub(crate) fn unpadded_fragment(&mut self, fragment_type: u32, body: Vec<u8>) {
+        self.fragments.push((fragment_type, body));
+    }
+
     pub(crate) fn build(&self) -> Vec<u8> {
         let mut strings = encode_string(&self.strings);
         strings.resize(strings.len().div_ceil(4) * 4, 0);
