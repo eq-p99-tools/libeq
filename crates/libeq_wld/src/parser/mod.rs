@@ -32,7 +32,6 @@ pub struct WldDoc {
     format: WldFormat,
     strings: StringHash,
     fragments: Vec<FragmentType>,
-    unread: Vec<UnreadBytes>,
 }
 
 /// The two known .wld layouts, told apart by the header's version.
@@ -59,19 +58,8 @@ impl WldFormat {
     }
 }
 
-/// A fragment whose parser stopped short of its end by more than the
-/// alignment padding a fragment may carry.
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UnreadBytes {
-    /// The fragment's index in the file.
-    pub index: usize,
-    pub fragment_type: u32,
-    /// How many bytes at the end of the fragment were not read.
-    pub bytes: usize,
-}
-
-/// Fragments are padded so their size is a multiple of 4.
+/// Fragments are padded so their size is a multiple of 4. A parser that
+/// stops more bytes than this short of a fragment's end has misread it.
 const MAX_PADDING: usize = 3;
 
 impl WldDoc {
@@ -92,20 +80,10 @@ impl WldDoc {
             .parse(i)
             .map_err(|e| vec![e.into()])?;
 
-        let (parsed, errors): (Vec<_>, Vec<_>) = fragment_headers
+        let (fragments, errors): (Vec<_>, Vec<_>) = fragment_headers
             .into_iter()
             .enumerate()
-            .map(|(idx, h)| {
-                let fragment_type = h.fragment_type;
-                h.parse_body(idx, format).map(|(fragment, unread)| {
-                    let unread = (unread > MAX_PADDING).then_some(UnreadBytes {
-                        index: idx,
-                        fragment_type,
-                        bytes: unread,
-                    });
-                    (fragment, unread)
-                })
-            })
+            .map(|(idx, h)| h.parse_body(idx, format))
             .partition_map(|res| match res {
                 Ok(frag) => Either::Left(frag),
                 Err(e) => Either::Right(e),
@@ -115,26 +93,17 @@ impl WldDoc {
             return Err(errors);
         }
 
-        let (fragments, unread): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
         Ok(WldDoc {
             header,
             format,
             strings,
             fragments,
-            unread: unread.into_iter().flatten().collect(),
         })
     }
 
     /// The layout of this file, from its header's version.
     pub fn format(&self) -> WldFormat {
         self.format
-    }
-
-    /// Fragments the parser did not read to their end, beyond alignment
-    /// padding. Data left there was not understood, so a non-empty list means
-    /// part of the file was not read.
-    pub fn unread(&self) -> &[UnreadBytes] {
-        &self.unread
     }
 
     pub fn fragment_headers_by_offset(input: &[u8]) -> BTreeMap<usize, FragmentHeader<'_>> {
@@ -388,13 +357,9 @@ impl<'a> FragmentHeader<'a> {
         ))
     }
 
-    /// Parses the fragment body, returning it with the number of bytes at its
-    /// end that the body's parser did not consume.
-    fn parse_body(
-        self,
-        index: usize,
-        format: WldFormat,
-    ) -> Result<(FragmentType, usize), WldDocError<'a>> {
+    /// Parses the fragment body. A body its parser does not read to its end,
+    /// beyond alignment padding, is an error.
+    fn parse_body(self, index: usize, format: WldFormat) -> Result<FragmentType, WldDocError<'a>> {
         let parsed = match self.fragment_type {
             DmSpriteDef::TYPE_ID => match self.detect_0x2c_variant() {
                 FragmentGame::EverQuest => Some(
@@ -562,22 +527,26 @@ impl<'a> FragmentHeader<'a> {
         };
 
         match parsed {
-            Some(res) => res
-                .map(|(rest, r)| (r, rest.len()))
-                .map_err(|e| match e.into() {
-                    WldDocError::Parse { input, message } => WldDocError::ParseFragment {
-                        index,
-                        offset: self.field_data.offset(input),
-                        header: self,
-                        message,
-                    },
-                    // This should never happen, the parse functions _only_
-                    // generate WldDocError::Parse errors
-                    e => panic!(
-                        "Invalid error type encountered when parsing fragment body: {:?}",
-                        e
-                    ),
-                }),
+            Some(Ok((rest, _))) if rest.len() > MAX_PADDING => Err(WldDocError::UnreadBytes {
+                index,
+                bytes: rest.len(),
+                header: self,
+            }),
+            Some(Ok((_, fragment))) => Ok(fragment),
+            Some(Err(e)) => Err(match e.into() {
+                WldDocError::Parse { input, message } => WldDocError::ParseFragment {
+                    index,
+                    offset: self.field_data.offset(input),
+                    header: self,
+                    message,
+                },
+                // This should never happen, the parse functions _only_
+                // generate WldDocError::Parse errors
+                e => panic!(
+                    "Invalid error type encountered when parsing fragment body: {:?}",
+                    e
+                ),
+            }),
             None => Err(WldDocError::UnknownFragment {
                 index,
                 header: self,
@@ -641,7 +610,6 @@ mod tests {
         assert_eq!(mesh.faces[0].vertex_indexes, (0, 1, 2));
         assert_eq!(mesh.face_material_groups, vec![(1, 0)]);
         assert_eq!(mesh.vertex_material_groups, vec![(3, 0)]);
-        assert_eq!(doc.unread(), &[]);
     }
 
     #[test]
@@ -661,7 +629,6 @@ mod tests {
         );
         assert_eq!(mesh.faces[0].vertex_indexes, (0, 1, 2));
         assert_eq!(mesh.face_material_groups, vec![(1, 0)]);
-        assert_eq!(doc.unread(), &[]);
     }
 
     #[test]
@@ -701,7 +668,6 @@ mod tests {
 
         assert_eq!(tracks[0].frames, vec![vec![(5, 6, 7)]]);
         assert_eq!(tracks[0].size6, None);
-        assert_eq!(doc.unread(), &[]);
     }
 
     #[test]
@@ -744,25 +710,44 @@ mod tests {
     }
 
     #[test]
-    fn it_reports_fragments_not_read_to_their_end() {
+    fn it_rejects_fragments_not_read_to_their_end() {
         let mut wld = WldBuilder::new(WldFormat::OLD_VERSION);
         let name = wld.name("P_MP");
-        // The meshes in the tests above end with a byte of padding, which is
-        // not reported; these eight bytes are data nobody read.
+        // The meshes in the tests above end with a byte of padding, which
+        // parses; these eight bytes are data nobody read.
         let mut overlong = palette(name, &[]);
         overlong.extend([0xab; 8]);
         wld.fragment(MaterialPalette::TYPE_ID, palette(name, &[]));
         wld.fragment(MaterialPalette::TYPE_ID, overlong);
-        let doc = WldDoc::parse(&wld.build()).unwrap();
+        let data = wld.build();
+        let errors = WldDoc::parse(&data).unwrap_err();
 
-        assert_eq!(
-            doc.unread(),
-            &[UnreadBytes {
+        let [
+            WldDocError::UnreadBytes {
                 index: 1,
-                fragment_type: MaterialPalette::TYPE_ID,
                 bytes: 8,
-            }]
-        );
+                header,
+            },
+        ] = &errors[..]
+        else {
+            panic!("expected one unread-bytes error, got {errors:?}");
+        };
+        assert_eq!(header.fragment_type, MaterialPalette::TYPE_ID);
+    }
+
+    #[test]
+    fn it_accepts_up_to_three_bytes_of_padding() {
+        for padding in 0..=3 {
+            let mut wld = WldBuilder::new(WldFormat::OLD_VERSION);
+            let name = wld.name("P_MP");
+            let mut body = palette(name, &[]);
+            body.extend(vec![0; padding]);
+            wld.unpadded_fragment(MaterialPalette::TYPE_ID, body);
+            assert!(
+                WldDoc::parse(&wld.build()).is_ok(),
+                "{padding} bytes of padding should parse"
+            );
+        }
     }
 
     #[cfg(feature = "gamedata")]
