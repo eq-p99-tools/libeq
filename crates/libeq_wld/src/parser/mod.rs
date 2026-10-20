@@ -685,6 +685,26 @@ mod tests {
     }
 
     #[test]
+    fn it_parses_vertex_animation_with_no_padding() {
+        let mut wld = WldBuilder::new(WldFormat::OLD_VERSION);
+        let name = wld.name("T_DMTRACKDEF");
+        // 18 + 6 × 1 vertex × 1 frame = 24 bytes, already a multiple of 4.
+        let mut body = Vec::new();
+        body.extend(name.to_le_bytes());
+        body.extend(0u32.to_le_bytes());
+        for word in [1u16, 1, 100, 0, 9, 5, 6, 7] {
+            body.extend(word.to_le_bytes());
+        }
+        wld.fragment(DmTrackDef2::TYPE_ID, body);
+        let doc = WldDoc::parse(&wld.build()).unwrap();
+        let tracks: Vec<_> = doc.fragment_iter::<DmTrackDef2>().collect();
+
+        assert_eq!(tracks[0].frames, vec![vec![(5, 6, 7)]]);
+        assert_eq!(tracks[0].size6, None);
+        assert_eq!(doc.unread(), &[]);
+    }
+
+    #[test]
     fn it_round_trips_both_formats() {
         for data in [
             one_triangle(
