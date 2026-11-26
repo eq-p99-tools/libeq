@@ -12,9 +12,13 @@ pub struct IndexEntry {
 impl IndexEntry {
     // All original .s3d files that I have seen use this as the CRC
     // for the directory file. I have no idea what string it corresponds to
-    // (if any). The EQZip tool appears to use 0xffffffff in place of this.
-    // So any archives written with that tool will currently fail.
+    // (if any).
     pub const DIRECTORY_CRC: u32 = 0x61580ac9;
+
+    // Archives repacked with the EQZip tool store 0xffffffff in place of
+    // `DIRECTORY_CRC` (community texture packs are built this way). The
+    // reader accepts it when no entry carries the original value.
+    pub const EQZIP_DIRECTORY_CRC: u32 = 0xffff_ffff;
 
     pub fn read(reader: &mut impl Read) -> Result<Self, Error> {
         let mut buf = [0u8; 4];
