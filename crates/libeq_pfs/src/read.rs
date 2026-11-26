@@ -345,9 +345,21 @@ fn from_reader<S: Read + Seek>(mut reader: S) -> Result<PfsReader<S>, Error> {
         })
         .collect::<Result<Vec<_>, Error>>()?;
 
+    // Original archives mark the directory with `DIRECTORY_CRC`; EQZip
+    // repacks use `EQZIP_DIRECTORY_CRC`. Prefer the original marker so an
+    // archive that happens to hold both still reads the same as before.
+    let directory_crc = if entries
+        .iter()
+        .any(|e| e.filename_crc == IndexEntry::DIRECTORY_CRC)
+    {
+        IndexEntry::DIRECTORY_CRC
+    } else {
+        IndexEntry::EQZIP_DIRECTORY_CRC
+    };
+
     let (directory_entries, file_entries): (Vec<_>, Vec<_>) = entries
         .into_iter()
-        .partition(|e| FilenameCrc::from(e.filename_crc) == FilenameCrc::DIRECTORY);
+        .partition(|e| e.filename_crc == directory_crc);
 
     let directory = directory_entries
         .into_iter()

@@ -73,6 +73,41 @@ mod tests {
     }
 
     #[test]
+    fn reads_eqzip_directory_marker() {
+        let test_files = [
+            ("test-file0", vec![0xde, 0xad, 0xbe, 0xef]),
+            ("test-file1", vec![0xca, 0xfe, 0xba, 0xbe]),
+        ];
+        let mut writer = PfsWriter::create(Cursor::new(Vec::new())).unwrap();
+        for f in &test_files {
+            writer.insert(f.0, Cursor::new(&f.1)).unwrap();
+        }
+        let mut bytes = writer.finish().unwrap().into_inner();
+
+        // Rewrite the directory's index entry the way EQZip stores it.
+        let index_offset = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let entry_count =
+            u32::from_le_bytes(bytes[index_offset..index_offset + 4].try_into().unwrap()) as usize;
+        let mut patched = 0;
+        for i in 0..entry_count {
+            let at = index_offset + 4 + i * 12;
+            if bytes[at..at + 4] == 0x61580ac9_u32.to_le_bytes() {
+                bytes[at..at + 4].copy_from_slice(&0xffff_ffff_u32.to_le_bytes());
+                patched += 1;
+            }
+        }
+        assert_eq!(patched, 1);
+
+        let mut reader = PfsReader::open(Cursor::new(bytes)).unwrap();
+        let filenames = reader.filenames().unwrap();
+        assert_eq!(filenames.len(), test_files.len());
+        for t in &test_files {
+            assert!(filenames.iter().any(|f| t.0 == f));
+            assert_eq!(&reader.get(t.0).unwrap().unwrap(), &t.1);
+        }
+    }
+
+    #[test]
     fn info() {
         let test_files = [
             ("test-file0", vec![0xde, 0xad, 0xbe, 0xef]),
